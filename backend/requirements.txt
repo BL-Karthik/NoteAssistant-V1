@@ -3,7 +3,6 @@ uvicorn
 python-dotenv
 psycopg[binary]
 qdrant-client
-sentence-transformers
 google-genai
 python-multipart
 pypdf

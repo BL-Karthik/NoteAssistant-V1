@@ -4,20 +4,101 @@ import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-COLLECTION_NAME = "note_chunks"
-EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
-VECTOR_SIZE = 384
+# Use a new collection because Gemini embeddings have 768 dimensions.
+# The existing 384-dimensional collection remains untouched.
+COLLECTION_NAME = "note_chunks_gemini_768"
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+VECTOR_SIZE = 768
 
 client = None
-embedding_model = None
+embedding_client = None
+
+
+# -----------------------------------
+# GENERATE EMBEDDINGS
+# -----------------------------------
+
+def generate_embeddings(texts, task_type, title=None):
+
+    if embedding_client is None:
+        raise RuntimeError("Gemini embedding client is not initialized")
+
+    if not texts:
+        return []
+
+    all_vectors = []
+    batch_size = 100
+
+    for start in range(0, len(texts), batch_size):
+
+        batch = texts[start:start + batch_size]
+
+        config_options = {
+            "task_type": task_type,
+            "output_dimensionality": VECTOR_SIZE
+        }
+
+        if title and task_type == "RETRIEVAL_DOCUMENT":
+            config_options["title"] = title
+
+        config = types.EmbedContentConfig(**config_options)
+
+        response = embedding_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config=config
+        )
+
+        if not response.embeddings:
+            raise RuntimeError("Gemini returned no embeddings")
+
+        for embedding in response.embeddings:
+
+            vector = embedding.values
+
+            if not vector or len(vector) != VECTOR_SIZE:
+                raise RuntimeError(
+                    f"Invalid embedding dimension. Expected {VECTOR_SIZE}"
+                )
+
+            all_vectors.append(vector)
+
+    if len(all_vectors) != len(texts):
+        raise RuntimeError("Embedding count does not match input count")
+
+    return all_vectors
+
+
+def generate_document_embedding(content, title=None):
+
+    vectors = generate_embeddings(
+        [content],
+        task_type="RETRIEVAL_DOCUMENT",
+        title=title
+    )
+
+    return vectors[0]
+
+
+def generate_query_embedding(query):
+
+    vectors = generate_embeddings(
+        [query],
+        task_type="RETRIEVAL_QUERY"
+    )
+
+    return vectors[0]
 
 
 # -----------------------------------
@@ -25,10 +106,14 @@ embedding_model = None
 # -----------------------------------
 
 def initialize_qdrant():
-    global client, embedding_model
+
+    global client, embedding_client
 
     if not QDRANT_URL or not QDRANT_API_KEY:
         raise RuntimeError("Qdrant credentials are missing")
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing")
 
     client = QdrantClient(
         url=QDRANT_URL,
@@ -36,9 +121,12 @@ def initialize_qdrant():
         timeout=30
     )
 
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+    embedding_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
     if not client.collection_exists(COLLECTION_NAME):
+
         client.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=models.VectorParams(
@@ -47,12 +135,15 @@ def initialize_qdrant():
             )
         )
 
+        print(f"Created Qdrant collection: {COLLECTION_NAME}")
+
     for field_name in [
         "document_id",
         "conversation_id",
         "type",
         "title"
     ]:
+
         client.create_payload_index(
             collection_name=COLLECTION_NAME,
             field_name=field_name,
@@ -61,6 +152,7 @@ def initialize_qdrant():
         )
 
     print("Qdrant connected successfully")
+    print("Gemini embedding client initialized successfully")
     print("Qdrant payload indexes verified successfully")
 
 
@@ -111,12 +203,13 @@ def chunk_text(text, chunk_size=800, overlap=120):
 
 def _save_note(note_id, content, title, conversation_id):
 
-    if client is None or embedding_model is None:
+    if client is None or embedding_client is None:
         raise RuntimeError("Qdrant is not initialized")
 
-    vector = embedding_model.encode(
-        "passage: " + content
-    ).tolist()
+    vector = generate_document_embedding(
+        content,
+        title=title
+    )
 
     point_id = str(
         uuid.uuid5(uuid.NAMESPACE_DNS, str(note_id))
@@ -203,7 +296,7 @@ def store_document_chunks(
     conversation_id
 ):
 
-    if client is None or embedding_model is None:
+    if client is None or embedding_client is None:
         raise RuntimeError("Qdrant is not initialized")
 
     chunks = chunk_text(content)
@@ -213,11 +306,15 @@ def store_document_chunks(
 
     updated_at = datetime.now(timezone.utc).isoformat()
 
-    delete_document_chunks(document_id)
+    # Generate all embeddings before deleting existing chunks.
+    vectors = generate_embeddings(
+        chunks,
+        task_type="RETRIEVAL_DOCUMENT",
+        title=filename
+    )
 
-    vectors = embedding_model.encode(
-        ["passage: " + chunk for chunk in chunks]
-    ).tolist()
+    # Replace previous chunks only after embedding succeeds.
+    delete_document_chunks(document_id)
 
     points = []
 
@@ -360,7 +457,6 @@ def is_valid_topic_title(title):
     if normalized in invalid_exact_titles:
         return False
 
-    # Exclude greeting-style titles.
     if normalized.startswith((
         "hello ",
         "hello,",
@@ -371,7 +467,6 @@ def is_valid_topic_title(title):
     )):
         return False
 
-    # Exclude test-message titles.
     if "test message" in normalized:
         return False
 
@@ -388,14 +483,8 @@ def get_global_topics():
     Retrieve unique meaningful global topic names.
 
     Only points with type='note' are included.
-
-    Excludes:
-    - Uploaded document chunks
-    - Greetings
-    - Test messages
-    - Placeholder titles
-
-    Returns one entry per unique topic title.
+    Excludes documents, greetings, test messages,
+    and placeholder titles.
     """
 
     if client is None:
@@ -480,22 +569,9 @@ def search_notes(
 
     """
     Semantic search with optional filters.
-
-    Global topic notes:
-        search_notes(query, note_type="note")
-
-    Uploaded document chunks:
-        search_notes(query, note_type="document")
-
-    One selected global topic:
-        search_notes(
-            query,
-            note_type="note",
-            topic_name="Note Assistant Project"
-        )
     """
 
-    if client is None or embedding_model is None:
+    if client is None or embedding_client is None:
         raise RuntimeError("Qdrant is not initialized")
 
     if not query or not query.strip():
@@ -504,9 +580,7 @@ def search_notes(
     if limit < 1:
         raise ValueError("Limit must be at least 1")
 
-    vector = embedding_model.encode(
-        "query: " + query.strip()
-    ).tolist()
+    vector = generate_query_embedding(query.strip())
 
     query_filter = build_search_filter(
         conversation_id=conversation_id,
@@ -554,7 +628,7 @@ def get_latest_documents(
 ):
 
     if client is None:
-        raise RuntimeError("Qdrant client is not initialized.")
+        raise RuntimeError("Qdrant is not initialized.")
 
     if limit < 1:
         raise ValueError("Limit must be at least 1.")
@@ -584,7 +658,6 @@ def get_latest_documents(
         must=document_conditions
     )
 
-    # Find documents belonging to this conversation.
     while True:
 
         results, next_offset = client.scroll(
@@ -636,7 +709,6 @@ def get_latest_documents(
 
     complete_documents = []
 
-    # Retrieve all chunks for each selected document.
     for document in latest_documents:
 
         chunks = []
